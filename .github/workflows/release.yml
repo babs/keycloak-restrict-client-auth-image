@@ -1,0 +1,81 @@
+name: "Monitor sventorben/keycloak-restrict-client-auth version and release"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release to build'
+        default: 'latest'
+  schedule:
+    - cron: '37 1-23/6 * * *'
+
+jobs:
+  check-precommit-release-and-release:
+    name: "Check upstream release and build if necessary"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v3
+
+      - name: Get upstream version and prepare build
+        id: prepare-release
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -e
+
+          RELEASE=${{ github.event.inputs.release || 'latest' }}
+
+          KRCA_REL_MANIFEST="$(curl -s https://api.github.com/repos/sventorben/keycloak-restrict-client-auth/releases/$RELEASE)"
+          KRCA_REL_VERSION="$(echo "$KRCA_REL_MANIFEST"| jq -r .name )"
+
+          # Rel message if not found, for example
+          API_REL_MESSAGE="$(echo "$KRCA_REL_MANIFEST"| jq -r .message )"
+          [ "$API_REL_MESSAGE" != "null" ] && ( echo "Error: requested release $API_REL_MESSAGE" | tee -a $GITHUB_STEP_SUMMARY ) && exit 2
+
+          [ "$KRCA_REL_VERSION" = "null" ] && ( echo "Error: bad release version '$KRCA_REL_VERSION'" | tee -a $GITHUB_STEP_SUMMARY ) && exit 1
+
+          KRCA_ASSET_URL="$(echo "$KRCA_REL_MANIFEST"| jq -r '.assets[]|select(.name == "keycloak-restrict-client-auth.jar") | .browser_download_url' )"
+          KRCA_REL_MAJOR=${KRCA_REL_VERSION%%.*}
+          
+          PROJECT_NAME="${GITHUB_REPOSITORY##*/}"
+          echo PROJECT_NAME=$PROJECT_NAME | tee -a $GITHUB_OUTPUT
+
+          REPO=${DOCKERHUB_USERNAME}/${PROJECT_NAME}
+          REGISTRY_TOKEN="$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:$REPO:pull" | jq -r .token)"
+          curl -sfo /dev/null -H "Authorization: Bearer $REGISTRY_TOKEN" \
+            -H "Accept: application/vnddocker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json" \
+            https://registry-1.docker.io/v2/$REPO/manifests/$KRCA_REL_VERSION && ( echo "Image already exists, build aborted." | tee -a $GITHUB_STEP_SUMMARY ) && BUILD_REQUIRED=n || true
+
+          echo REL_TAG="${RELEASE##*/}" | tee -a $GITHUB_ENV
+          echo BUILD_REQUIRED=${BUILD_REQUIRED:-y} | tee -a $GITHUB_ENV
+          echo KRCA_REL_VERSION=$KRCA_REL_VERSION | tee -a $GITHUB_ENV
+          echo KRCA_ASSET_URL=$KRCA_ASSET_URL | tee -a $GITHUB_ENV
+          echo KRCA_REL_MAJOR=$KRCA_REL_MAJOR | tee -a $GITHUB_ENV
+          echo DOCKER_CREDS_DEFINED=$([ -z "$DOCKERHUB_USERNAME" -o -z "DOCKERHUB_TOKEN" ] && echo n || echo y) | tee -a $GITHUB_ENV
+        
+
+      - name: Set up Docker Buildx
+        if: ${{ env.BUILD_REQUIRED == 'y' && env.DOCKER_CREDS_DEFINED == 'y' }}
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        if: ${{ env.BUILD_REQUIRED == 'y' && env.DOCKER_CREDS_DEFINED == 'y' }}
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        if: ${{ env.BUILD_REQUIRED == 'y' && env.DOCKER_CREDS_DEFINED == 'y' }}
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          build-args:
+            KRCA_ASSET_URL=${{ env.KRCA_ASSET_URL }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.prepare-release.outputs.PROJECT_NAME }}:${{ env.REL_TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.prepare-release.outputs.PROJECT_NAME }}:${{ env.KRCA_REL_MAJOR }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ steps.prepare-release.outputs.PROJECT_NAME }}:${{ env.KRCA_REL_VERSION }}
